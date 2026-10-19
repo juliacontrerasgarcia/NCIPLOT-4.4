@@ -22,6 +22,14 @@
 ! along with this program.  If not, see <http://www.gnu.org/licenses/>.
 !
 ! This is NCIPLOT Ver. 4.4
+!
+! NCICLUSTER and NCIENERGY, formerly Python scripts run with system(), are
+! the Fortran modules nci_cluster (nci_cluster.f90) and nci_energy
+! (nci_energy.f90): Python is no longer needed.
+!
+! xtb is located when nciplot is compiled (Makefile: $XTB_HOME, else the
+! src_4.4/ directory, else the compilation stops with "xtb missing"); see
+! nci_xtb.f90.
 
 program nciplot
    use param
@@ -29,16 +37,16 @@ program nciplot
    use tools_math
    use reader
    use props
+   use nci_cluster, only: ncicluster_t, ncicluster_run
+   use nci_energy, only: ncienergy_run
+   use nci_xtb, only: xtb_report
 !   USE IEEE_ARITHMETIC
-   use, intrinsic :: iso_c_binding
    implicit none
 
-   ! python ones
-   integer(c_int) :: py_status
-   character(kind=c_char, len=10000) :: command_ncicluster
-   character(kind=c_char, len=10000) :: command_ncienergy
-   integer :: iounit_p1
+   ! NCICLUSTER and NCIENERGY
    logical :: doclustering, ncienergy, isverbose, supra
+   type(ncicluster_t) :: clres
+   real*8, allocatable :: clrange(:, :), range_int(:, :)
 
    integer, parameter :: mfiles = 100 ! max number of geometry files
 
@@ -91,9 +99,6 @@ program nciplot
    integer :: natommax, igroup, natom
    integer, allocatable, dimension(:, :) :: group
    real*8, allocatable, dimension(:, :) :: xinitat, xmaxat, nstepat
-   ! ncicluster variable progression
-   character(len=32) :: tmp_real, tmp_logical
-   logical :: tmp_ispromol
 
    ! Initializing multilevel grids
    integer :: ind_g, ng
@@ -222,6 +227,18 @@ program nciplot
    !===============================================================================!
    dimcut = 1.0d0  ! RDG cutoff
    isordg = 0.5d0
+   ! defaults for all input types (some are set again below for non-cube inputs)
+   ntotal = 0
+   rhoparam = 0.75d0
+   inter = .false.
+   ligand = .false.
+   dointeg = .false.
+   dorange = .false.
+   nranges = 0
+   doclustering = .false.
+   ncienergy = .false.
+   supra = .false.
+   isverbose = .false.
    if (.not.isnotcube) then
       rhocut=0.05d0                    ! density cutoff for printing, in cube case
    endif
@@ -240,8 +257,8 @@ program nciplot
       inter = .false.                  ! intermolecular keyword
       rthres = 0.75d0/bohrtoa          ! box limits around the molecule
       dointeg = .false.                ! integrating properties or not
-      doclustering = .false.           ! clustering python script NCICLUSTER
-      ncienergy = .false.              ! energy calculation with python script NCIENERGY
+      doclustering = .false.           ! clustering, NCICLUSTER (nci_cluster.f90)
+      ncienergy = .false.              ! energy calculation, NCIENERGY (nci_energy.f90)
       isverbose = .false.              ! option to print complete output 
       dorange = .false.                ! do not integrate range
       firstgrid = .true.               ! flag for the first adaptive grid run
@@ -333,7 +350,7 @@ do while (.true.)
          read (line, *) rhocut
 
       case ("CLUSTERING")  ! integration
-         doclustering = .true.              ! python script cluster
+         doclustering = .true.              ! NCICLUSTER
       
       case ("NCIENERGY")
          ncienergy = .true.
@@ -600,6 +617,7 @@ do while (.true.)
    if (ispromol) write (uout, 133) ! tell user promolecular mode is on
    if (doclustering) write (uout, 138) ! tell user clustering will happen
    if (isverbose) write (uout, 120)
+   call xtb_report(isverbose)       ! where xtb is (nci_xtb.f90; found by the Makefile)
    write (uout, 110) ' RHO  THRESHOLD   (au):', rhocut
    write (uout, 110) ' RDG  THRESHOLD   (au):', dimcut
    if (inter) write (uout, 110) ' INTERMOLECULARITY THRESHOLD :', rhoparam
@@ -1185,8 +1203,10 @@ do while (.true.)
       allocate (box_in_range(0:nstep(1) - 1, 0:nstep(2) - 1, 0:nstep(3) - 1,1:nranges), stat=istat)
       if (istat /= 0) call error('nciplot', 'could not allocate memory for box_in_range', faterr)
   
-      allocate (rho_range(1:nranges),stat=istat)    
-  
+      allocate (rho_range(1:nranges),stat=istat)
+      allocate (range_int(9, nranges), stat=istat)   ! integrals of each range, used by NCIENERGY
+      if (istat /= 0) call error('nciplot', 'could not allocate memory for range_int', faterr)
+
       write (uout, 134)
       !call DoRangeWarning() ! warning: change in active box criterion
   
@@ -1232,8 +1252,9 @@ do while (.true.)
          tmp_rmbox_range_tmp(:,:,:)= box_in_range(:,:,:,i)
          call dataGeom_points(sum_rhon_vol, sum_signrhon_vol, xinc, nstep, crho, crho_n, cgrad, &
                   rmbox_coarse,tmp_rmbox_range_tmp, nfiles, csteric)
-         write (uout, 135) srhorange(i,1), srhorange(i,2), sum_rhon_vol, sum_signrhon_vol 
+         write (uout, 135) srhorange(i,1), srhorange(i,2), sum_rhon_vol, sum_signrhon_vol
          rho_range(i) = sum_rhon_vol(1)
+         range_int(:, i) = sum_rhon_vol
       enddo
       ! Additivy check
       sumrangedensity = sum(rho_range)
@@ -1286,6 +1307,22 @@ do while (.true.)
    if (allocated(rho_range)) deallocate (rho_range)
    if (allocated(rmpoint_coarse)) deallocate (rmpoint_coarse)
 
+   !===============================================================================!
+   ! NCICLUSTER: division of the NCI region into clusters, on the final grid
+   ! (nci_cluster.f90). Fortran version of the Python script by Katarzyna Zator.
+   ! Uses the RANGE intervals, or -0.2 -0.02 if RANGE is not given.
+   !===============================================================================!
+   if (doclustering) then
+      if (dorange) then
+         allocate (clrange(nranges, 2))
+         clrange = srhorange
+      else
+         allocate (clrange(1, 2))
+         clrange(1, :) = (/-0.2d0, -0.02d0/)
+      end if
+      call ncicluster_run(oname, nstep, xinit, xinc, crho, cgrad, m, nfiles, dimcut, size(clrange, 1), clrange, &
+                          noutput >= 2, clres)
+   end if
 
    !===============================================================================!
    ! Deallocate grids, close files.
@@ -1319,92 +1356,14 @@ do while (.true.)
    end if
 
    !===============================================================================!
-   ! NCICLUSTER python script integration. Author: Katarzyna Zator
-   !===============================================================================!
-   if(doclustering) then 
-      iounit_p1 = 501
-      open(unit=iounit_p1, file='tmp_ncicluster_file', status='replace', action='write')
-      ! Write the strings to the file
-      write(iounit_p1, '(A)') trim(adjustl(oname))
-      ! Close the file
-      close(iounit_p1)
-
-      tmp_ispromol = ispromol
-      write(tmp_real, '(F5.2)') dimcut
-      write(tmp_logical, '(L1)') tmp_ispromol
-      command_ncicluster = trim(adjustl(nciplot_home)) // 'scripts/NCICLUSTER.py' // &
-                        ' tmp_ncicluster_file --isovalue ' // trim(adjustl(tmp_real)) // &
-                        ' --ispromol ' // trim(adjustl(tmp_logical))
-      if (allocated(filenames)) then
-         do k = 1, size(filenames)
-            command_ncicluster = trim(command_ncicluster) // ' --mol ' // trim(adjustl(filenames(k)))
-         end do
-      end if
-      do i = 1, size(srhorange, 1)
-         do j = 1, size(srhorange, 2)
-            write(tmp_real, '(F5.2)') srhorange(i, j)
-            if (j == 1) then
-               command_ncicluster = trim(command_ncicluster) // ' --range ' // trim(adjustl(tmp_real))
-            else
-               command_ncicluster = trim(command_ncicluster) // ' --range ' // trim(adjustl(tmp_real))
-            end if
-         end do
-      end do
-      py_status = system(trim(adjustl(command_ncicluster)))
-      ! Check the return py_status
-      select case (py_status)
-      case (0)
-           print *, "Python script executed successfully."
-      case (256)
-           print *, "Installation error: Required python library is not installed."
-      case (32512)
-           print *, "Python script execution failed, remeber to set NCIPLOT_HOME environment variable."
-      case default
-           print *, "Python script failed with unexpected status code: ", py_status
-           print *, "Remember to install all necessary Python libraries"
-      end select
-      py_status=unlink("tmp_ncicluster_file")
-   endif  ! clustering
-
-   !===============================================================================!
-   ! NCIENERGY python script integration. Author: Katarzyna Zator
+   ! NCIENERGY: interaction energies from the range (or cluster) integrals
+   ! (nci_energy.f90). Fortran version of the Python script by Katarzyna Zator.
    !===============================================================================!
    if (ncienergy) then
-      iounit_p1 = 501
-      open(unit=iounit_p1, file='tmp_ncienergy_file', status='replace', action='write')
-      ! Write the strings to the file
-      write(iounit_p1, '(A)') trim(adjustl(oname))
-      ! Close the file
-      close(iounit_p1)
-      write(command_ncienergy, '(A,A,A,A,A,A,F5.1,A,F5.2,A,F5.2,A,F5.2,A,L1,A,L1,A,L1,A,L1,A,A,A,A)') &
-      trim(adjustl(nciplot_home)), 'scripts/NCIENERGY.py', & 
-      ' tmp_ncienergy_file', &
-      ' --oname ', oname, &
-      ' --isovalue ', dimcut, &
-      ' --outer ', srhorange(3, 2), &
-      ' --inner ', srhorange(3, 1), &
-      ' --gamma ', rhoparam, &
-      ' --intermol ', inter, &
-      ' --ispromol ', ispromol, &
-      ' --clustering ', doclustering, &
-      ' --supra ', supra, &
-      ' --mol1 ', filenames(1), &
-      ' --mol2 ', filenames(2)
-      py_status = system(trim(adjustl(command_ncienergy)))
-      ! Check the return py_status
-      select case (py_status)
-      case (0)
-         print *, "Python script executed successfully."
-      case (256)
-         print *, "Installation error: Required python library is not installed."
-      case (32512)
-         print *, "Python script execution failed, remeber to set NCIPLOT_HOME environment variable."
-      case default
-         print *, "Python script failed with unexpected status code: ", py_status
-         print *, "Remember to install all necessary Python libraries"
-      end select
-      py_status=unlink("tmp_ncienergy_file")
-   
+      if (.not. allocated(srhorange)) allocate (srhorange(0, 2))
+      if (.not. allocated(range_int)) allocate (range_int(9, 0))
+      call ncienergy_run(ispromol, supra, inter, doclustering, dimcut, rhoparam, size(srhorange, 1), srhorange, &
+                         range_int, m, nfiles, clres)
    endif
 
    !===============================================================================!
@@ -1416,6 +1375,8 @@ do while (.true.)
    if (allocated(nstepat)) deallocate (nstepat)
    if (allocated(m)) deallocate (m)
    if (allocated(srhorange)) deallocate (srhorange)
+   if (allocated(clrange)) deallocate (clrange)
+   if (allocated(range_int)) deallocate (range_int)
    if (allocated(tmp_crho)) deallocate (tmp_crho)
    if (allocated(tmp_crho_n)) deallocate (tmp_crho_n)
    if (allocated(tmp_cheigs)) deallocate (tmp_cheigs)
